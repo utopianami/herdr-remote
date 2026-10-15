@@ -1,0 +1,14 @@
+id = "herdr.push.remote"
+name = "Herdr Push Remote"
+version = "0.5.2"
+min_herdr_version = "0.7.0"
+description = "Push agent status to a remote dashboard for mobile monitoring and one-tap approval"
+platforms = ["macos", "linux"]
+
+[[events]]
+on = "pane.closed"
+command = ["sh", "on_event.sh"]
+
+[[events]]
+on = "workspace.closed"
+command = ["sh", "on_event.sh"]

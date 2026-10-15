@@ -4,11 +4,13 @@
 # dependencies = ["textual>=3.0.0", "websockets>=14.0"]
 # ///
 """herdr-remote-tui: terminal dashboard for herdr agents. Connects to herdr-remote-relay via WebSocket."""
-import asyncio, json, os, sys
+import asyncio
+import json
+import os
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Header, Footer, Static, Input, Button, Label, Rule
+from textual.widgets import Header, Footer, Static, Input, Button, Label
 from textual.reactive import reactive
 from textual.message import Message
 from textual import work
@@ -16,6 +18,14 @@ from textual import work
 from agent_state import apply_agent_message
 
 RELAY_WS = os.environ.get("HERDR_RELAY", "ws://127.0.0.1:8375")
+
+
+def agent_location(agent: dict) -> str:
+    project = agent.get("project") or "unknown"
+    tab_label = agent.get("tab_label")
+    host = agent.get("host")
+    location = f"{project} / {tab_label}" if tab_label else project
+    return f"{location} @{host}" if host else location
 
 
 class AgentCard(Static):
@@ -27,10 +37,10 @@ class AgentCard(Static):
 
     def compose(self) -> ComposeResult:
         status = self.agent.get("status", "unknown")
-        color = {"blocked": "red", "working": "green", "idle": "dim"}.get(status, "dim")
+        color = {"blocked": "red", "working": "green", "done": "blue", "idle": "dim"}.get(status, "dim")
         name = self.agent.get("agent", "?")
-        label = self.agent.get("label", "") or self.agent.get("project", "")
-        yield Label(f"[{color}]●[/] {label}/{name} [{color}]{status}[/]", markup=True)
+        location = agent_location(self.agent)
+        yield Label(f"[{color}]●[/] {location}/{name} [{color}]{status}[/]", markup=True)
 
 
 class AgentColumn(Vertical):
@@ -49,71 +59,36 @@ class ApprovalPanel(Vertical):
     """Shows when an agent is blocked — prompt + buttons."""
 
     class Responded(Message):
-        def __init__(self, pane_id: str, prompt_id: str | None, text: str):
+        def __init__(self, pane_id: str, text: str):
             super().__init__()
             self.pane_id = pane_id
-            self.prompt_id = prompt_id
             self.text = text
-
-    class QuestionToggled(Message):
-        def __init__(self, pane_id: str, prompt_id: str, option: str):
-            super().__init__()
-            self.pane_id = pane_id
-            self.prompt_id = prompt_id
-            self.option = option
-
-    class QuestionSubmitted(Message):
-        def __init__(self, pane_id: str, prompt_id: str):
-            super().__init__()
-            self.pane_id = pane_id
-            self.prompt_id = prompt_id
 
     def __init__(self, agent: dict, **kw):
         super().__init__(**kw)
         self.agent = agent
         self.styles.height = "auto"
         self.styles.border = ("round", "red")
-        self.border_title = f"⚠ {agent.get('agent', '?')} — {agent.get('label', '') or agent.get('project', '')}"
+        self.border_title = f"⚠ {agent.get('agent', '?')} — {agent_location(agent)}"
 
     def compose(self) -> ComposeResult:
         prompt = self.agent.get("prompt", "Waiting for input...")
         yield Static(prompt[:400], classes="prompt-text")
-        # Both multi-select interactions: omp's arrow-key question grammar and the numbered
-        # checkbox menu (claude's multiSelect). Same protocol shape, different keys behind it.
-        multi = self.agent.get("interaction") in {"omp_question", "multi_question"} and self.agent.get("multi")
-        options = self.agent.get("multi_options") if multi else self.agent.get("options")
-        options = options or []
-        selected = set(self.agent.get("selected_options") or [])
+        options = self.agent.get("options") or []
         for i, opt in enumerate(options):
             color = "green" if "yes" in opt or "approve" in opt else "red" if "no" in opt or "cancel" in opt else "blue"
-            label = f"{'☑' if opt in selected else '☐'} {opt}" if multi else opt
-            button_id = f"multi-{i}" if multi else f"opt-{i}"
-            yield Button(label, id=button_id, variant="success" if color == "green" else "error" if color == "red" else "primary")
-        if multi:
-            yield Button("Submit", id="multi-submit", variant="success")
+            yield Button(opt, id=f"opt-{i}", variant="success" if color == "green" else "error" if color == "red" else "primary")
         yield Input(placeholder="Custom response…", id="custom-input")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "multi-submit":
-            if prompt_id := self.agent.get("prompt_id"):
-                self.post_message(self.QuestionSubmitted(self.agent["pane_id"], prompt_id))
-            return
-        if event.button.id.startswith("multi-"):
-            idx = int(event.button.id.split("-")[1])
-            options = self.agent.get("multi_options") or []
-            if idx < len(options) and (prompt_id := self.agent.get("prompt_id")):
-                self.post_message(
-                    self.QuestionToggled(self.agent["pane_id"], prompt_id, options[idx])
-                )
-            return
         idx = int(event.button.id.split("-")[1])
         options = self.agent.get("options") or []
         if idx < len(options):
-            self.post_message(self.Responded(self.agent["pane_id"], self.agent.get("prompt_id"), options[idx]))
+            self.post_message(self.Responded(self.agent["pane_id"], f"__choice__:{idx + 1}"))
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.value.strip():
-            self.post_message(self.Responded(self.agent["pane_id"], self.agent.get("prompt_id"), event.value.strip()))
+            self.post_message(self.Responded(self.agent["pane_id"], event.value.strip()))
 
 
 class HerdrRemoteTUI(App):
@@ -150,6 +125,10 @@ class HerdrRemoteTUI(App):
             with AgentColumn("⚡ Working", "green", id="col-working"):
                 for a in self._agents_data:
                     if a.get("status") == "working":
+                        yield AgentCard(a)
+            with AgentColumn("✓ Done", "blue", id="col-done"):
+                for a in self._agents_data:
+                    if a.get("status") == "done":
                         yield AgentCard(a)
             with AgentColumn("💤 Idle", "grey", id="col-idle"):
                 for a in self._agents_data:
@@ -214,35 +193,11 @@ class HerdrRemoteTUI(App):
             self.recompose()
 
     def on_approval_panel_responded(self, event: ApprovalPanel.Responded) -> None:
-        self._send_response(event.pane_id, event.prompt_id, event.text)
+        self._send_response(event.pane_id, event.text)
 
-    def on_approval_panel_question_toggled(self, event: ApprovalPanel.QuestionToggled) -> None:
+    def _send_response(self, pane_id: str, text: str):
         if self._ws:
-            msg = json.dumps({
-                "type": "question_toggle",
-                "pane_id": event.pane_id,
-                "prompt_id": event.prompt_id,
-                "option": event.option,
-            })
-            asyncio.ensure_future(self._ws.send(msg))
-
-    def on_approval_panel_question_submitted(self, event: ApprovalPanel.QuestionSubmitted) -> None:
-        if self._ws:
-            msg = json.dumps({
-                "type": "question_submit",
-                "pane_id": event.pane_id,
-                "prompt_id": event.prompt_id,
-            })
-            asyncio.ensure_future(self._ws.send(msg))
-            self._blocked_data = [
-                blocked for blocked in self._blocked_data
-                if blocked.get("pane_id") != event.pane_id
-            ]
-            self.recompose()
-
-    def _send_response(self, pane_id: str, prompt_id: str | None, text: str):
-        if self._ws:
-            msg = json.dumps({"type": "respond", "pane_id": pane_id, "prompt_id": prompt_id, "text": text})
+            msg = json.dumps({"type": "respond", "pane_id": pane_id, "text": text})
             asyncio.ensure_future(self._ws.send(msg))
             # Remove from blocked
             self._blocked_data = [b for b in self._blocked_data if b.get("pane_id") != pane_id]
@@ -254,9 +209,8 @@ class HerdrRemoteTUI(App):
     def action_approve_first(self) -> None:
         if self._blocked_data:
             a = self._blocked_data[0]
-            options = a.get("options") or []
-            if options:
-                self._send_response(a["pane_id"], a.get("prompt_id"), options[0])
+            options = a.get("options") or ["yes, single permission"]
+            self._send_response(a["pane_id"], options[0])
 
 
 if __name__ == "__main__":
